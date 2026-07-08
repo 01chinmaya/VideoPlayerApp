@@ -77,7 +77,10 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.C
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -101,7 +104,8 @@ data class VideoItem(
     val title: String,
     val uri: Uri,
     val duration: Long,
-    val size: Long
+    val size: Long,
+    val subtitleUris: List<Uri> = emptyList()
 )
 
 interface VideoRepository {
@@ -143,10 +147,55 @@ class LocalVideoRepository(private val context: Context) : VideoRepository {
                     MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                     id
                 )
-                videoList.add(VideoItem(id, name, contentUri, duration, size))
+                val subtitles = findSubtitlesForVideo(context, name)
+                videoList.add(VideoItem(id, name, contentUri, duration, size, subtitles))
             }
         }
         emit(videoList)
+    }
+
+    private fun findSubtitlesForVideo(context: Context, videoName: String): List<Uri> {
+        val subtitleUris = mutableListOf<Uri>()
+        val baseName = videoName.substringBeforeLast(".")
+        if (baseName.isEmpty()) return emptyList()
+
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns._ID,
+            MediaStore.Files.FileColumns.DISPLAY_NAME
+        )
+        val selection = "${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ? AND (${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE '%.srt' OR ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE '%.vtt')"
+        val selectionArgs = arrayOf("$baseName%")
+
+        val queryUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Files.getContentUri("external")
+        }
+
+        try {
+            context.contentResolver.query(
+                queryUri,
+                projection,
+                selection,
+                selectionArgs,
+                null
+            )?.use { cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+                val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idColumn)
+                    val name = cursor.getString(nameColumn) ?: continue
+                    val fileBaseName = name.substringBeforeLast(".")
+                    if (fileBaseName.equals(baseName, ignoreCase = true)) {
+                        val uri = ContentUris.withAppendedId(queryUri, id)
+                        subtitleUris.add(uri)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return subtitleUris
     }
 }
 
@@ -408,10 +457,29 @@ fun VideoPlayerScreen(
 ) {
     val context = LocalContext.current
 
-    // Remember ExoPlayer instance
+    // Remember ExoPlayer instance with custom DefaultRenderersFactory preferring extension decoders
     val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            val mediaItem = MediaItem.fromUri(video.uri)
+        val renderersFactory = DefaultRenderersFactory(context).apply {
+            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+        }
+        ExoPlayer.Builder(context, renderersFactory).build().apply {
+            val mediaItemBuilder = MediaItem.Builder().setUri(video.uri)
+            if (video.subtitleUris.isNotEmpty()) {
+                val subtitleConfigs = video.subtitleUris.map { subUri ->
+                    val mimeType = if (subUri.toString().endsWith(".vtt", ignoreCase = true)) {
+                        MimeTypes.TEXT_VTT
+                    } else {
+                        MimeTypes.APPLICATION_SUBRIP
+                    }
+                    MediaItem.SubtitleConfiguration.Builder(subUri)
+                        .setMimeType(mimeType)
+                        .setLanguage("en")
+                        .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
+                        .build()
+                }
+                mediaItemBuilder.setSubtitleConfigurations(subtitleConfigs)
+            }
+            val mediaItem = mediaItemBuilder.build()
             setMediaItem(mediaItem)
             prepare()
             playWhenReady = true
@@ -430,53 +498,10 @@ fun VideoPlayerScreen(
         }
     }
 
-    // State management
-    var isPlaying by remember { mutableStateOf(true) }
-    var currentPosition by remember { mutableStateOf(0L) }
-    var totalDuration by remember { mutableStateOf(0L) }
-
+    // State management for overlays (title, back button, double-tap indicators)
     var controlsVisible by remember { mutableStateOf(true) }
-    var controlsVisibilityTrigger by remember { mutableStateOf(0) }
-
     var showForwardIndicator by remember { mutableStateOf(false) }
     var showBackwardIndicator by remember { mutableStateOf(false) }
-
-    // Observe player states
-    DisposableEffect(exoPlayer) {
-        val listener = object : Player.Listener {
-            override fun onIsPlayingChanged(isPlayingChanged: Boolean) {
-                isPlaying = isPlayingChanged
-            }
-
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_READY) {
-                    totalDuration = exoPlayer.duration.coerceAtLeast(0L)
-                }
-            }
-        }
-        exoPlayer.addListener(listener)
-        onDispose {
-            exoPlayer.removeListener(listener)
-        }
-    }
-
-    // Periodically update currentPosition
-    LaunchedEffect(exoPlayer, isPlaying) {
-        if (isPlaying) {
-            while (true) {
-                currentPosition = exoPlayer.currentPosition
-                delay(200)
-            }
-        }
-    }
-
-    // Auto-fade controls after 3 seconds
-    LaunchedEffect(controlsVisible, controlsVisibilityTrigger) {
-        if (controlsVisible) {
-            delay(3000)
-            controlsVisible = false
-        }
-    }
 
     // Reset double-tap indicators
     LaunchedEffect(showForwardIndicator) {
@@ -502,17 +527,23 @@ fun VideoPlayerScreen(
             .fillMaxSize()
             .background(Color.Black)
     ) {
+        var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
+
         // Media3 PlayerView wrapped in AndroidView
         AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
                     player = exoPlayer
-                    useController = false // disable default controls
+                    useController = true // enable default controls
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
+                        controlsVisible = (visibility == android.view.View.VISIBLE)
+                    })
                 }
             },
             update = { playerView ->
                 playerView.player = exoPlayer
+                playerViewRef = playerView
             },
             modifier = Modifier.fillMaxSize()
         )
@@ -533,11 +564,15 @@ fun VideoPlayerScreen(
                                     showBackwardIndicator = true
                                     exoPlayer.seekTo((exoPlayer.currentPosition - 10000).coerceAtLeast(0L))
                                 }
-                                controlsVisibilityTrigger++ // Reset fade-out timer on double tap
                             },
                             onTap = {
-                                controlsVisible = !controlsVisible
-                                controlsVisibilityTrigger++
+                                playerViewRef?.let {
+                                    if (it.isControllerFullyVisible) {
+                                        it.hideController()
+                                    } else {
+                                        it.showController()
+                                    }
+                                }
                             }
                         )
                     }
@@ -586,103 +621,6 @@ fun VideoPlayerScreen(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-            }
-
-            // Custom Control Overlay (Bottom controls and Play/Pause center overlay)
-            AnimatedVisibility(
-                visible = controlsVisible,
-                enter = fadeIn(),
-                exit = fadeOut(),
-                modifier = Modifier.fillMaxSize()
-            ) {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    // Play/Pause button in center
-                    IconButton(
-                        onClick = {
-                            if (isPlaying) exoPlayer.pause() else exoPlayer.play()
-                            controlsVisibilityTrigger++
-                        },
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .size(72.dp)
-                            .background(
-                                color = Color.Black.copy(alpha = 0.5f),
-                                shape = CircleShape
-                            )
-                    ) {
-                        Icon(
-                            imageVector = if (isPlaying) {
-                                Icons.Default.Pause
-                            } else {
-                                Icons.Default.PlayArrow
-                            },
-                            contentDescription = if (isPlaying) "Pause" else "Play",
-                            tint = Color.White,
-                            modifier = Modifier.size(48.dp)
-                        )
-                    }
-
-                    // Progress bar & Time label at bottom
-                    Column(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .background(
-                                brush = Brush.verticalGradient(
-                                    colors = listOf(
-                                        Color.Transparent,
-                                        Color.Black.copy(alpha = 0.8f)
-                                    )
-                                )
-                            )
-                            .padding(16.dp)
-                    ) {
-                        var isScrubbing by remember { mutableStateOf(false) }
-                        var scrubPosition by remember { mutableStateOf(0L) }
-
-                        val displayPosition = if (isScrubbing) scrubPosition else currentPosition
-                        val sliderValue = if (totalDuration > 0) displayPosition.toFloat() / totalDuration else 0f
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = formatDuration(displayPosition),
-                                color = Color.White,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-
-                            Slider(
-                                value = sliderValue,
-                                onValueChange = { value ->
-                                    isScrubbing = true
-                                    scrubPosition = (value * totalDuration).toLong()
-                                    controlsVisibilityTrigger++
-                                },
-                                onValueChangeFinished = {
-                                    isScrubbing = false
-                                    exoPlayer.seekTo(scrubPosition)
-                                    controlsVisibilityTrigger++
-                                },
-                                colors = SliderDefaults.colors(
-                                    thumbColor = MaterialTheme.colorScheme.primary,
-                                    activeTrackColor = MaterialTheme.colorScheme.primary,
-                                    inactiveTrackColor = Color.Gray
-                                ),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .padding(horizontal = 8.dp)
-                            )
-
-                            Text(
-                                text = formatDuration(totalDuration),
-                                color = Color.White,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
-                    }
-                }
             }
         }
     }
